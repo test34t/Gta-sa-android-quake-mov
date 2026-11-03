@@ -1,11 +1,11 @@
-// QuakeMove64 v2 - movimentação estilo Half-Life / CS:GO / Quake para GTA SA Android 2.10 (arm64)
-// Plugin AML. Usa as structs/símbolos do aml-psdk (que suporta a 2.10 64-bit).
+// QuakeMove64 v2 - movimentacao estilo Half-Life / CS:GO / Quake para GTA SA Android 2.10 (arm64)
+// Plugin AML. Usa as structs/simbolos do aml-psdk (que suporta a 2.10 64-bit).
 //
 // O que faz:
-//  * física de chão/ar do GoldSrc (atrito, accelerate, air-strafe), presets "hl", "csgo", "quake"
-//  * pulo PRÓPRIO e determinístico (altura fixa, autohop, buffer de pulo) - não depende da animação do CJ
-//  * câmera em primeira pessoa enquanto o plugin está ativo e o CJ está a pé
-//  * direção do analógico calibrada sozinha contra o que o próprio jogo quer fazer
+//  * fisica de chao/ar do GoldSrc (atrito, accelerate, air-strafe), presets "hl", "csgo", "quake"
+//  * pulo PROPRIO e deterministico (altura fixa, autohop, buffer de pulo) - nao depende da animacao do CJ
+//  * camera em primeira pessoa enquanto o plugin esta ativo e o CJ esta a pe
+//  * direcao do analogico calibrada sozinha contra o que o proprio jogo quer fazer
 #include <float.h>
 #include <mod/amlmod.h>
 #include <mod/logger.h>
@@ -23,25 +23,26 @@
 MYMODCFG(net.quakemove.gtasa64, Quake Movement 64, 2.0.1, QuakeMove)
 NEEDGAME(com.rockstargames.gtasa)
 
-// ---------------------------------------------------------------- configuração
+// ---------------------------------------------------------------- configuracao
 
 struct Settings
 {
     bool  enabled       = true;
-    bool  autoHop       = true;   // segurar pulo = bunny hop automático
-    bool  ownJump       = true;   // pulo próprio (altura fixa). false = pulo nativo do jogo
-    bool  firstPerson   = true;   // câmera em 1ª pessoa quando o plugin está ativo
-    bool  firstPersonAim = true;  // também em 1ª pessoa ao mirar com arma (câmera de mira do jogo)
-    bool  autoCalibrate = true;   // acerta sozinho frente/trás e esquerda/direita
-    bool  flipFwd       = false;  // frente/trás invertidos
+    bool  autoHop       = true;   // segurar pulo = bunny hop automatico
+    bool  ownJump       = true;   // pulo proprio (altura fixa). false = pulo nativo do jogo
+    bool  firstPerson   = true;   // camera em 1a pessoa quando o plugin esta ativo
+    bool  firstPersonAim = true;  // tambem em 1a pessoa ao mirar com arma (camera de mira do jogo)
+    bool  autoCalibrate = true;   // acerta sozinho frente/tras e esquerda/direita
+    bool  flipFwd       = false;  // frente/tras invertidos
     bool  flipStrafe    = false;  // esquerda/direita invertidos
     bool  debug         = false;
-    float fov           = 85.0f;  // 0 = não mexe no FOV
-    float nearClip      = 0.2f;   // 0 = não mexe no near clip
+    float fov           = 85.0f;  // 0 = nao mexe no FOV
+    float nearClip      = 0.2f;   // 0 = nao mexe no near clip
     float eyeHeight     = 0.62f;  // altura dos olhos acima do centro do CJ
-    float eyeForward    = 0.12f;  // quanto a câmera avança à frente da cabeça (evita ver o rosto)
-    float pitchScale    = 1.0f;   // >1 aumenta o alcance de olhar para cima/baixo
-    int   jumpBufferMs  = 100;    // apertar pulo até X ms antes de pousar também vale
+    float eyeForward    = 0.12f;  // quanto a camera avanca a frente da cabeca (evita ver o rosto)
+    float pitchSens     = 3.0f;   // velocidade de olhar para cima/baixo (rad/s com o analogico/toque no maximo)
+    bool  pitchInvert   = false;  // inverte olhar vertical
+    int   jumpBufferMs  = 100;    // apertar pulo ate X ms antes de pousar tambem vale
     qm::Params p;
 } g;
 
@@ -71,10 +72,17 @@ struct State
     CPlayerPed*  ped         = nullptr;
     bool         active      = false;   // estamos controlando a velocidade?
     bool         wasOnGround = true;
-    bool         fpActive    = false;   // 1ª pessoa desejada neste frame (lido pelo hook da câmera)
+    bool         fpActive    = false;   // 1a pessoa desejada neste frame (lido pelo hook da camera)
     qm::V2       vel         = { 0, 0 };  // m/s
     qm::V2       lastWritten = { 0, 0 };
     float        gEst        = 20.0f;   // gravidade medida (m/s^2)
+    float        pitch       = 0.0f;    // inclinacao propria da camera (rad)
+    bool         pitchInit   = false;
+    float        dirX        = 0.0f, dirY = 1.0f; // direcao horizontal da camera
+    bool         launched    = false;   // lancamos um pulo no frame anterior
+    float        launchV0    = 0.0f;
+    int          launchFails = 0;
+    float        rawLook     = 0.0f;
     qm::JumpState js;
     qm::AxisVote calF, calR;
     unsigned     frame       = 0;
@@ -89,7 +97,7 @@ struct State
 
 static bool g_hasTaskChecks = false;
 static bool g_hasCamHook    = false;
-static int  g_jumpField     = -1;     // índice (em i16) do botão de pulo dentro de CControllerState
+static int  g_jumpField     = -1;     // indice (em i16) do botao de pulo dentro de CControllerState
 static int  g_jumpFindTries = 0;
 
 static float g_origNear       = 0.0f;
@@ -116,7 +124,7 @@ static bool IsBadPedState(unsigned s)
     return false;
 }
 
-// Condições mínimas: o jogador está a pé, vivo e com controle (sem cutscene).
+// Condicoes minimas: o jogador esta a pe, vivo e com controle (sem cutscene).
 static bool BaseOk(CPlayerPed* ped, CPad* pad)
 {
     if (!g.enabled || !pad) return false;
@@ -126,10 +134,10 @@ static bool BaseOk(CPlayerPed* ped, CPad* pad)
     return true;
 }
 
-// Condições para a física Quake assumir a velocidade.
+// Condicoes para a fisica Quake assumir a velocidade.
 static bool MoveOk(CPlayerPed* ped)
 {
-    if (ped->bIsAimingGun || ped->bIsDucking) return false; // mirando/agachado: o jogo move relativo à mira
+    if (ped->bIsAimingGun || ped->bIsDucking) return false; // mirando/agachado: o jogo move relativo a mira
     if (ped->bKnockedUpIntoAir) return false;
     if (ped->bIsInWater || ped->bSubmergedInWater) return false;
     if (IsBadPedState((unsigned)ped->m_ePedState)) return false;
@@ -146,14 +154,14 @@ static bool MoveOk(CPlayerPed* ped)
 static bool IsFpCamMode(int mode)
 {
     if (mode == MODE_FOLLOWPED || mode == MODE_FOLLOW_PED_WITH_BIND) return true;
-    // mirando com arma a pé: a câmera de mira do jogo também vira 1ª pessoa (a direção da mira é mantida)
+    // mirando com arma a pe: a camera de mira do jogo tambem vira 1a pessoa (a direcao da mira e mantida)
     return g.firstPersonAim && mode == MODE_AIMWEAPON;
 }
 
-// ---------------------------------------------------------------- botão de pulo
+// ---------------------------------------------------------------- botao de pulo
 
-// Descobre qual campo do CControllerState o jogo lê como "pulo": zera um campo por vez e vê se GetJump() cai.
-// Assim não dependemos de saber se é Square/Cross/etc. neste port Android.
+// Descobre qual campo do CControllerState o jogo le como "pulo": zera um campo por vez e ve se GetJump() cai.
+// Assim nao dependemos de saber se e Square/Cross/etc. neste port Android.
 static void FindJumpField(CPad* pad)
 {
     i16* f = (i16*)&pad->NewState;
@@ -183,7 +191,7 @@ static void FindJumpField(CPad* pad)
     }
 }
 
-// ---------------------------------------------------------------- helpers de câmera / corpo
+// ---------------------------------------------------------------- helpers de camera / corpo
 
 static void ForceHeading(CPlayerPed* p, float yaw)
 {
@@ -218,7 +226,7 @@ static void RestoreNearClip()
     }
 }
 
-// ---------------------------------------------------------------- hook: câmera (1ª pessoa)
+// ---------------------------------------------------------------- hook: camera (1a pessoa)
 
 DECL_HOOKv(CCam_Process, CCam* self)
 {
@@ -238,21 +246,37 @@ DECL_HOOKv(CCam_Process, CCam* self)
     if (len < 0.001f) return;
     fx /= len; fy /= len; fz /= len;
 
-    // alcance vertical (a câmera de 3ª pessoa do jogo limita bastante o olhar para cima/baixo)
-    if (g.pitchScale != 1.0f)
+    // olhar vertical PROPRIO: a camera de 3a pessoa do jogo limita muito o olhar para cima/baixo.
+    float hz = sqrtf(fx * fx + fy * fy);
+    float gamePitch = atan2f(fz, hz);
+    if (hz > 0.05f) { st.dirX = fx / hz; st.dirY = fy / hz; }
+    if (!st.pitchInit || mode == MODE_AIMWEAPON)
     {
-        float hz = sqrtf(fx * fx + fy * fy);
-        if (hz > 0.001f)
-        {
-            float pitch = atan2f(fz, hz) * g.pitchScale;
-            if (pitch > 1.45f) pitch = 1.45f;
-            if (pitch < -1.45f) pitch = -1.45f;
-            float ch = cosf(pitch);
-            fx = fx / hz * ch;
-            fy = fy / hz * ch;
-            fz = sinf(pitch);
-            self->m_vecFront = { fx, fy, fz };
-        }
+        st.pitch = gamePitch;       // mirando: vale a inclinacao do jogo
+        st.pitchInit = true;
+    }
+    else
+    {
+        CPad* lp = CPad::GetPad(0);
+        float raw = lp ? (float)lp->LookAroundUpDown() : 0.0f;
+        if (raw == 0.0f && lp) raw = (float)lp->NewState.RightStickY;
+        st.rawLook = raw;
+        float r = raw / 128.0f;
+        if (r > 4.0f) r = 4.0f;
+        if (r < -4.0f) r = -4.0f;
+        float ts = CTimer::ms_fTimeStep;
+        if (!(ts > 0.0f) || ts > 5.0f) ts = 1.0f;
+        float sgn = g.pitchInvert ? 1.0f : -1.0f;
+        st.pitch += sgn * r * g.pitchSens * ts * 0.02f;
+        if (st.pitch > 1.5f) st.pitch = 1.5f;
+        if (st.pitch < -1.5f) st.pitch = -1.5f;
+    }
+    {
+        float ch = cosf(st.pitch);
+        fx = st.dirX * ch;
+        fy = st.dirY * ch;
+        fz = sinf(st.pitch);
+        self->m_vecFront = { fx, fy, fz };
     }
 
     CVector pos = st.ped->GetPosition();
@@ -279,11 +303,11 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
     bool move = base && MoveOk(self);
     float now = (float)((unsigned)CTimer::GetTimeMS()) * 0.001f;
 
-    // velocidade que o motor deixou depois da colisão do frame anterior
+    // velocidade que o motor deixou depois da colisao do frame anterior
     qm::V2 pre = { self->m_vecMoveSpeed.x * 50.0f, self->m_vecMoveSpeed.y * 50.0f };
     float preZ = self->m_vecMoveSpeed.z * 50.0f;
 
-    // --- entrada de pulo (lida ANTES de mascarar) e máscara do botão para o jogo
+    // --- entrada de pulo (lida ANTES de mascarar) e mascara do botao para o jogo
     bool down = false, edge = false;
     bool maskNew = false, maskOld = false;
     i16 savedNew = 0, savedOld = 0;
@@ -297,7 +321,7 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
         {
             if (g.ownJump)
             {
-                // o pulo é nosso: o jogo não pode ver o botão (senão pula duas vezes / trava no pouso)
+                // o pulo e nosso: o jogo nao pode ver o botao (senao pula duas vezes / trava no pouso)
                 i16* nf = (i16*)&pad->NewState;
                 savedNew = nf[g_jumpField];
                 nf[g_jumpField] = 0;
@@ -305,7 +329,7 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
             }
             else if (g.autoHop && down && self->bIsStanding)
             {
-                // pulo nativo + autohop: finge que o botão acabou de ser apertado
+                // pulo nativo + autohop: finge que o botao acabou de ser apertado
                 i16* of = (i16*)&pad->OldState;
                 savedOld = of[g_jumpField];
                 of[g_jumpField] = 0;
@@ -314,7 +338,7 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
         }
     }
 
-    CPlayerPed_ProcessControl(self);   // lógica original (tasks, animações, input...)
+    CPlayerPed_ProcessControl(self);   // logica original (tasks, animacoes, input...)
 
     if (maskNew) ((i16*)&pad->NewState)[g_jumpField] = savedNew;
     if (maskOld) ((i16*)&pad->OldState)[g_jumpField] = savedOld;
@@ -331,23 +355,38 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
 
     bool onGround = self->bIsStanding;
 
+    // --- o pulo proprio funcionou? (o motor deve ter mantido a velocidade vertical para cima)
+    if (st.launched)
+    {
+        st.launched = false;
+        if (preZ < st.launchV0 * 0.4f)
+        {
+            if (++st.launchFails >= 3 && g.ownJump)
+            {
+                g.ownJump = false;
+                logger->Error("pulo proprio nao pegou (vz=%.2f de %.2f) - voltando ao pulo nativo com autohop", preZ, st.launchV0);
+            }
+        }
+        else st.launchFails = 0;
+    }
+
     // --- gravidade real do jogo (para a altura do pulo ficar exata)
     if (!onGround)
         st.gEst = qm::EstimateGravity(st.gEst, preZ, self->m_vecMoveSpeed.z * 50.0f, dt);
 
-    // --- base de movimento: vetor "front" da câmera ativa (direção do olhar)
+    // --- base de movimento: vetor "front" da camera ativa (direcao do olhar)
     CCam& acam = TheCamera.GetActiveCam();
     qm::View view = qm::MakeView(acam.m_vecFront.x, acam.m_vecFront.y);
     int camMode = (int)acam.m_nMode;
 
-    // --- entrada do analógico (sinais canônicos do SA: cima = negativo)
+    // --- entrada do analogico (sinais canonicos do SA: cima = negativo)
     float rawF = -(float)pad->GetPedWalkUpDown() / 128.0f;
     float rawR =  (float)pad->GetPedWalkLeftRight() / 128.0f;
     rawF = rawF > 1.0f ? 1.0f : (rawF < -1.0f ? -1.0f : rawF);
     rawR = rawR > 1.0f ? 1.0f : (rawR < -1.0f ? -1.0f : rawR);
     float smag = sqrtf(rawF * rawF + rawR * rawR);
 
-    // --- calibração: compara com a direção que o PRÓPRIO jogo quer andar (m_fAimingRotation)
+    // --- calibracao: compara com a direcao que o PROPRIO jogo quer andar (m_fAimingRotation)
     if (g.autoCalibrate && view.valid && smag > 0.5f && onGround && !self->bIsAimingGun)
     {
         float th = self->m_fAimingRotation;
@@ -381,20 +420,20 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
     float inF = g.flipFwd ? -rawF : rawF;
     float inR = g.flipStrafe ? -rawR : rawR;
 
-    // --- 1ª pessoa: o corpo olha para onde a câmera olha (e a câmera não "foge" para trás do CJ)
+    // --- 1a pessoa: o corpo olha para onde a camera olha (e a camera nao "foge" para tras do CJ)
     st.fpActive = g.firstPerson && g_hasCamHook;
     if (st.fpActive && view.valid && IsFpCamMode(camMode) && !self->bIsAimingGun)
         ForceHeading(self, view.yaw);
 
     if (!move)
     {
-        // sem física Quake agora (mirando, agachado, nadando...)
+        // sem fisica Quake agora (mirando, agachado, nadando...)
         st.Reset();
         if (g.ownJump && g_jumpField >= 0) qm::JumpUpdate(st.js, now, false, down, edge, g.autoHop, 0.0f, 0.0f);
         return;
     }
 
-    // --- empurrões externos (colisão com parede, explosão); o arrasto do motor é ignorado
+    // --- empurroes externos (colisao com parede, explosao); o arrasto do motor e ignorado
     if (st.active)
     {
         qm::V2 d;
@@ -403,11 +442,9 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
             st.vel.x += d.x;
             st.vel.y += d.y;
         }
-    }
-
     qm::Wish wish = qm::MakeWish(view.fwd, view.right, inF, inR, g.p.maxSpeed);
 
-    // --- pulo próprio
+    // --- pulo proprio
     bool ownJumpOn = g.ownJump && g_jumpField >= 0;
     bool wantJump = false;
     if (ownJumpOn)
@@ -424,7 +461,7 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
 
     if (!st.active)
     {
-        st.vel = pre;            // começa de onde o jogo estava
+        st.vel = pre;            // comeca de onde o jogo estava
         st.active = true;
         st.wasOnGround = onGround;
     }
@@ -432,15 +469,17 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
     // --- decolagem
     if (wantJump)
     {
-        qm::PreventMegaBhop(st.vel, g.p);      // só faz algo se BhopCap > 0 (GoldSrc)
+        qm::PreventMegaBhop(st.vel, g.p);      // so faz algo se BhopCap > 0 (GoldSrc)
         float v0 = qm::JumpSpeed(g.p.jumpHeight, st.gEst);
         self->m_vecMoveSpeed.z = v0 / 50.0f;
         self->bIsStanding = false;
+        st.launched = true;
+        st.launchV0 = v0;
         if (g.debug) logger->Info("PULO v0=%.2f m/s g=%.1f vel=%.2f", v0, st.gEst, qm::Len(st.vel));
     }
 
-    // --- um passo de física Quake/GoldSrc.
-    // Frame do pulo conta como "ar": não tem atrito (é isso que conserva a velocidade no bhop).
+    // --- um passo de fisica Quake/GoldSrc.
+    // Frame do pulo conta como "ar": nao tem atrito (e isso que conserva a velocidade no bhop).
     bool groundPhys = onGround && !wantJump;
     bool noFric = holdHop;
     qm::Step(st.vel, groundPhys, noFric, wish, dt, g.p);
@@ -453,8 +492,8 @@ DECL_HOOKv(CPlayerPed_ProcessControl, CPlayerPed* self)
 
     if (g.debug && (st.frame++ % 60) == 0)
     {
-        logger->Info("vel=%.2f m/s ground=%d wish=%.2f jumpDown=%d field=%d g=%.1f cam=%d fp=%d flipF=%d flipR=%d votesF=%d/%d votesR=%d/%d state=%u",
-                     qm::Len(st.vel), (int)onGround, wish.speed, (int)down, g_jumpField, st.gEst, camMode, (int)st.fpActive,
+        logger->Info("look=%.0f pitch=%.2f vel=%.2f m/s ground=%d wish=%.2f jumpDown=%d field=%d g=%.1f cam=%d fp=%d flipF=%d flipR=%d votesF=%d/%d votesR=%d/%d state=%u",
+                     st.rawLook, st.pitch, qm::Len(st.vel), (int)onGround, wish.speed, (int)down, g_jumpField, st.gEst, camMode, (int)st.fpActive,
                      (int)g.flipFwd, (int)g.flipStrafe, st.calF.agree, st.calF.disagree, st.calR.agree, st.calR.disagree,
                      (unsigned)self->m_ePedState);
     }
@@ -473,7 +512,7 @@ ON_MOD_LOAD()
         return;
     }
 
-    // Se algum símbolo essencial não existir nessa versão do jogo, não instala nada (o jogo roda normal).
+    // Se algum simbolo essencial nao existir nessa versao do jogo, nao instala nada (o jogo roda normal).
     const char* required[] = {
         "_ZTV10CPlayerPed", "_Z13FindPlayerPedi", "_ZN4CPad6GetPadEi",
         "_ZN4CPad19GetPedWalkLeftRightEv", "_ZN4CPad16GetPedWalkUpDownEv",
@@ -494,7 +533,7 @@ ON_MOD_LOAD()
         aml->GetSym(hGTASA, "_ZNK16CPedIntelligence11GetTaskDuckEb");
     g_hasCamHook = (aml->GetSym(hGTASA, "_ZN4CCam7ProcessEv") != 0);
 
-    // ---- Config (arquivo .ini criado na primeira execução, pode editar sem recompilar)
+    // ---- Config (arquivo .ini criado na primeira execucao, pode editar sem recompilar)
     char preset[16] = {0};
     cfg->Bind("Preset", "hl", "QuakeMove")->GetString(preset, sizeof(preset));   // hl | csgo | quake
     delete Config::pLastEntry;
@@ -517,7 +556,8 @@ ON_MOD_LOAD()
     g.nearClip      = CfgF("NearClip", g.nearClip);
     g.eyeHeight     = CfgF("EyeHeight", g.eyeHeight);
     g.eyeForward    = CfgF("EyeForward", g.eyeForward);
-    g.pitchScale    = CfgF("PitchScale", g.pitchScale);
+    g.pitchSens     = CfgF("PitchSens", g.pitchSens);
+    g.pitchInvert   = CfgB("PitchInvert", false);
     g.jumpBufferMs  = CfgI("JumpBufferMs", g.jumpBufferMs);
 
     g.p.maxSpeed      = CfgF("MaxSpeed", g.p.maxSpeed);           // m/s
@@ -534,7 +574,7 @@ ON_MOD_LOAD()
     HOOK(CPlayerPed_ProcessControl, GetNativeVtable<CPlayerPed>("_ZTV10CPlayerPed")[11]);
     if (g_hasCamHook)
     {
-        HOOKSYM(CCam_Process, hGTASA, "_ZN4CCam7ProcessEv");   // a macro já termina com ';'
+        HOOKSYM(CCam_Process, hGTASA, "_ZN4CCam7ProcessEv");   // a macro ja termina com ';'
     }
     else
     {
