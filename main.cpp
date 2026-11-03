@@ -534,4 +534,14 @@ ON_MOD_LOAD()
     HOOK(CPlayerPed_ProcessControl, GetNativeVtable<CPlayerPed>("_ZTV10CPlayerPed")[11]);
     if (g_hasCamHook)
     {
-        HOOKSYM(CCam_Process, hGTASA, "_ZN4CCam7ProcessEv");   // a macro já t
+        HOOKSYM(CCam_Process, hGTASA, "_ZN4CCam7ProcessEv");   // a macro já termina com ';'
+    }
+    else
+    {
+        logger->Error("CCam::Process nao encontrado - primeira pessoa desativada");
+    }
+
+    logger->Info("QuakeMove v2 carregado (preset=%s maxspeed=%.2f accel=%.1f airaccel=%.1f jump=%.2fm autohop=%d ownjump=%d fp=%d)",
+                 preset, g.p.maxSpeed, g.p.accelerate, g.p.airAccelerate, g.p.jumpHeight,
+                 (int)g.autoHop, (int)g.ownJump, (int)(g.firstPerson && g_hasCamHook));
+}
